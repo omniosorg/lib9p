@@ -30,6 +30,12 @@
 #include <string.h>
 #include <unistd.h>
 
+#if defined(__sun)
+# define _POSIX_C_SOURCE 200112L
+# define _POSIX_PTHREAD_SEMANTICS
+# include <pwd.h>
+#endif
+
 #if defined(WITH_CASPER)
 #include <libcasper.h>
 #include <casper/cap_pwd.h>

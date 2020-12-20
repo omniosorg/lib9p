@@ -41,12 +41,20 @@
 #else
 #include "sbuf/sbuf.h"
 #endif
+#if defined(__sun)
+#include <sys/sysmacros.h>
+#include <limits.h>
+#endif
 #include "lib9p.h"
 #include "fcall.h"
 #include "linux_errno.h"
 
 #ifdef __APPLE__
   #define GETGROUPS_GROUP_TYPE_IS_INT
+#endif
+
+#if defined(__sun)
+extern void strmode(int, char *);
 #endif
 
 #define N(ary)          (sizeof(ary) / sizeof(*ary))

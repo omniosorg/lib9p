@@ -36,6 +36,9 @@
 #include <sys/param.h>
 #ifdef __APPLE__
 # include "apple_endian.h"
+#elif defined(__sun)
+# include "illumos_endian.h"
+# include <sys/sysmacros.h>		// for MIN()
 #else
 # include <sys/endian.h>
 #endif

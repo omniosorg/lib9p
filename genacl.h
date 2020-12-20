@@ -82,6 +82,10 @@
   #define HAVE_FREEBSD_ACLS
 #endif
 
+#if defined(__sun)
+  #define HAVE_POSIX_ACLS
+#endif
+
 #include <sys/types.h>
 #include <sys/acl.h>		/* XXX assumes existence of sys/acl.h */
 

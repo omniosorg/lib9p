@@ -38,7 +38,11 @@
 #include "fid.h"
 #include "log.h"
 
+#ifdef __sun
+typedef int econvertfn(ace_t, struct l9p_ace *);
+#else
 typedef int econvertfn(acl_entry_t, struct l9p_ace *);
+#endif
 
 #ifndef __APPLE__
 static struct l9p_acl *l9p_new_acl(uint32_t acetype, uint32_t aceasize);
@@ -453,7 +457,7 @@ l9p_ace_mask_to_rwx(int32_t opmask)
 	return (rwx);
 }
 
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(__sun)
 /*
  * Allocate new ACL holder and ACEs.
  */

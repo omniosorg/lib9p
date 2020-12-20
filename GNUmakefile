@@ -44,7 +44,8 @@ LIB_SRCS := \
 	threadpool.c \
 	sbuf/sbuf.c \
 	transport/socket.c \
-	backend/fs.c
+	backend/fs.c \
+	compat/strmode.c
 
 SERVER_SRCS := \
 	example/server.c

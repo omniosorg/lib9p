@@ -36,6 +36,9 @@
 #else
 #include "sbuf/sbuf.h"
 #endif
+#if defined(__sun)
+#include <sys/sysmacros.h>
+#endif
 #include "lib9p.h"
 #include "lib9p_impl.h"
 #include "fcall.h"
@@ -293,7 +296,9 @@ e2linux(int errnum)
 		[EHOSTDOWN] = LINUX_EHOSTDOWN,
 		[EHOSTUNREACH] = LINUX_EHOSTUNREACH,
 		[ENOTEMPTY] = LINUX_ENOTEMPTY,
+#ifndef __sun
 		[EPROCLIM] = LINUX_EAGAIN,
+#endif
 		[EUSERS] = LINUX_EUSERS,
 		[EDQUOT] = LINUX_EDQUOT,
 		[ESTALE] = LINUX_ESTALE,
