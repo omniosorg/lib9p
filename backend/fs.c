@@ -23,6 +23,7 @@
  * IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  *
+ * Copyright 2021 Joyent, Inc.
  */
 
 /*
@@ -80,9 +81,26 @@
   #define ACL_TYPE_NFS4 ACL_TYPE_EXTENDED
 #endif
 
+#if defined (__illumos__)
+  #include <sys/sysmacros.h>
+  #include <sys/statvfs.h>
+  #include <sys/un.h>
+  #include <attr.h>
+  #include <sys/nvpair.h>
+#endif
+
 struct fs_softc {
 	int 	fs_rootfd;
 	bool	fs_readonly;
+#if defined(__illumos__)
+	/*
+	 * On illumos, the file creation time (birthtime) is stored (on
+	 * supported filesystems -- i.e. zfs) in an extended attribute.
+	 * If for some reason the fs doesn't support extended attributes,
+	 * we skip trying to read the creation time.
+	 */
+	bool	fs_hasxattr;
+#endif
 #if defined(WITH_CASPER)
 	cap_channel_t *fs_cappwd;
 	cap_channel_t *fs_capgrp;
@@ -99,6 +117,23 @@ struct fs_fid {
 	pthread_mutex_t ff_mtx;
 	struct l9p_acl *ff_acl; /* cached ACL if any */
 };
+
+#if defined(__FreeBSD__)
+# define	STATFS_FSID(_s) \
+	(((uint64_t)(_s)->f_fsid.val[0] << 32) | (uint64_t)(_s)->f_fsid.val[1])
+
+# define	STAT_ATIME(_s)	((_s)->st_atimespec)
+# define	STAT_MTIME(_s)	((_s)->st_mtimespec)
+# define	STAT_CTIME(_s)	((_s)->st_ctimespec)
+#elif defined (__illumos__)
+# define	STATFS_FSID(_s)	((_s)->f_fsid)
+
+# define	STAT_ATIME(_s)	((_s)->st_atim)
+# define	STAT_MTIME(_s)	((_s)->st_mtim)
+# define	STAT_CTIME(_s)	((_s)->st_ctim)
+#else
+#error "Port me"
+#endif
 
 #define	FF_NO_NFSV4_ACL	0x01	/* don't go looking for NFSv4 ACLs */
 /*	FF_NO_POSIX_ACL	0x02	-- not yet */
@@ -149,6 +184,8 @@ struct fs_authinfo {
 static bool fs_attach_mutex_inited;
 static pthread_mutex_t fs_attach_mutex;
 
+static pthread_mutexattr_t fs_mutexattr;
+
 /*
  * Internal functions (except inline functions).
  */
@@ -165,7 +202,15 @@ static int fs_nde(struct fs_softc *, struct l9p_fid *, bool, gid_t,
 static struct fs_fid *open_fid(int, const char *, struct fs_authinfo *, bool);
 static void dostat(struct fs_softc *, struct l9p_stat *, char *,
     struct stat *, bool dotu);
+#ifdef __illumos__
+static void getcrtime(struct fs_softc *, int, const char *, uint64_t *,
+    uint64_t *);
+static void dostatfs(struct l9p_statfs *, struct statvfs *, long);
+#define	ACL_TYPE_NFS4 1
+acl_t *acl_get_fd_np(int fd, int type);
+#else
 static void dostatfs(struct l9p_statfs *, struct statfs *, long);
+#endif
 static void fillacl(struct fs_fid *ff);
 static struct l9p_acl *getacl(struct fs_fid *ff, int fd, const char *path);
 static void dropacl(struct fs_fid *ff);
@@ -562,7 +607,11 @@ open_fid(int dirfd, const char *path, struct fs_authinfo *ai, bool creating)
 	int error;
 
 	ret = l9p_calloc(1, sizeof(*ret));
+#ifdef __illumos__
+	error = pthread_mutex_init(&ret->ff_mtx, &fs_mutexattr);
+#else
 	error = pthread_mutex_init(&ret->ff_mtx, NULL);
+#endif
 	if (error) {
 		free(ret);
 		return (NULL);
@@ -571,13 +620,18 @@ open_fid(int dirfd, const char *path, struct fs_authinfo *ai, bool creating)
 	ret->ff_dirfd = dirfd;
 	ret->ff_name = strdup(path);
 	if (ret->ff_name == NULL) {
-		pthread_mutex_destroy(&ret->ff_mtx);
+		(void) pthread_mutex_destroy(&ret->ff_mtx);
 		free(ret);
 		return (NULL);
 	}
-	pthread_mutex_lock(&ai->ai_mtx);
+	if (pthread_mutex_lock(&ai->ai_mtx) != 0) {
+		(void) pthread_mutex_destroy(&ret->ff_mtx);
+		free(ret->ff_name);
+		free(ret);
+		return (NULL);
+	}
 	newcount = ++ai->ai_refcnt;
-	pthread_mutex_unlock(&ai->ai_mtx);
+	(void) pthread_mutex_unlock(&ai->ai_mtx);
 	/*
 	 * If we just incremented the count to 1, we're the *first*
 	 * reference.  This is only allowed when creating the authinfo,
@@ -674,19 +728,30 @@ dostat(struct fs_softc *sc, struct l9p_stat *s, char *name,
 	}
 }
 
-static void dostatfs(struct l9p_statfs *out, struct statfs *in, long namelen)
+#ifndef __illumos__
+static void
+dostatfs(struct l9p_statfs *out, struct statfs *in, long namelen)
+#else
+static void
+dostatfs(struct l9p_statfs *out, struct statvfs *in, long namelen)
+#endif
 {
 
 	out->type = L9P_FSTYPE;
 	out->bsize = in->f_bsize;
+#ifndef __illumos__
 	out->blocks = in->f_blocks;
 	out->bfree = in->f_bfree;
 	out->bavail = in->f_bavail;
+#else
+	out->blocks = in->f_blocks * in->f_frsize / in->f_bsize;
+	out->bfree = in->f_bfree * in->f_frsize / in->f_bsize;
+	out->bavail = in->f_bavail * in->f_frsize / in->f_bsize;
+#endif
 	out->files = in->f_files;
 	out->ffree = in->f_ffree;
 	out->namelen = (uint32_t)namelen;
-	out->fsid = ((uint64_t)in->f_fsid.val[0] << 32) |
-	    (uint64_t)in->f_fsid.val[1];
+	out->fsid = STATFS_FSID(in);
 }
 
 static void
@@ -760,7 +825,11 @@ static struct l9p_acl *
 look_for_nfsv4_acl(struct fs_fid *ff, int fd, const char *path)
 {
 	struct l9p_acl *acl;
+#ifdef __illumos__
+	acl_t *sysacl;
+#else
 	acl_t sysacl;
+#endif
 	int doclose = 0;
 
 	if (fd < 0) {
@@ -788,6 +857,8 @@ look_for_nfsv4_acl(struct fs_fid *ff, int fd, const char *path)
 	}
 #if defined(HAVE_FREEBSD_ACLS)
 	acl = l9p_freebsd_nfsv4acl_to_acl(sysacl);
+#elif defined(HAVE__ILLUMOS_ACLS)
+	acl = l9p_illumos_nfsv4acl_to_acl(sysacl);
 #else
 	acl = NULL; /* XXX need a l9p_darwin_acl_to_acl */
 #endif
@@ -862,15 +933,18 @@ fs_attach(void *softc, struct l9p_request *req)
 	 * r_getpwuid but not a reentrant r_getpwnam, and l9p_getgrlist
 	 * may use non-reentrant C library getgr* routines.
 	 */
-	pthread_mutex_lock(&fs_attach_mutex);
+	if ((error = pthread_mutex_lock(&fs_attach_mutex)) != 0)
+		return (error);
 
 	n_uname = req->lr_req.tattach.n_uname;
 	if (n_uname != L9P_NONUNAME) {
 		uid = (uid_t)n_uname;
 		pwd = fs_getpwuid(sc, uid, &udata);
+#if defined(L9P_DEBUG)
 		if (pwd == NULL)
 			L9P_LOG(L9P_DEBUG,
 			    "Tattach: uid %ld: no such user", (long)uid);
+#endif
 	} else {
 		uid = (uid_t)-1;
 #if defined(WITH_CASPER)
@@ -878,10 +952,12 @@ fs_attach(void *softc, struct l9p_request *req)
 #else
 		pwd = getpwnam(req->lr_req.tattach.uname);
 #endif
+#if defined(L9P_DEBUG)
 		if (pwd == NULL)
 			L9P_LOG(L9P_DEBUG,
 			    "Tattach: %s: no such user",
 			    req->lr_req.tattach.uname);
+#endif
 	}
 
 	/*
@@ -904,7 +980,7 @@ fs_attach(void *softc, struct l9p_request *req)
 			error = ENOTDIR;
 	}
 	if (error) {
-		pthread_mutex_unlock(&fs_attach_mutex);
+		(void) pthread_mutex_unlock(&fs_attach_mutex);
 		L9P_LOG(L9P_DEBUG,
 		    "Tattach: denying uid=%ld access to rootdir: %s",
 		    (long)uid, strerror(error));
@@ -932,14 +1008,18 @@ fs_attach(void *softc, struct l9p_request *req)
 	 * Done with pwd and group related items that may use
 	 * non-reentrant C library routines; allow other threads in.
 	 */
-	pthread_mutex_unlock(&fs_attach_mutex);
+	(void) pthread_mutex_unlock(&fs_attach_mutex);
 
 	ai = malloc(sizeof(*ai) + (size_t)ngroups * sizeof(gid_t));
 	if (ai == NULL) {
 		free(gids);
 		return (ENOMEM);
 	}
+#ifdef __illumos__
+	error = pthread_mutex_init(&ai->ai_mtx, &fs_mutexattr);
+#else
 	error = pthread_mutex_init(&ai->ai_mtx, NULL);
+#endif
 	if (error) {
 		free(gids);
 		free(ai);
@@ -954,7 +1034,7 @@ fs_attach(void *softc, struct l9p_request *req)
 
 	file = open_fid(sc->fs_rootfd, ".", ai, true);
 	if (file == NULL) {
-		pthread_mutex_destroy(&ai->ai_mtx);
+		(void) pthread_mutex_destroy(&ai->ai_mtx);
 		free(ai);
 		return (ENOMEM);
 	}
@@ -1404,7 +1484,7 @@ fs_imknod(void *softc, struct l9p_fid *dir, char *name,
 
 	/* We cannot open the new name; race to use l* syscalls. */
 	if (fchownat(ff->ff_dirfd, newname, uid, gid, AT_SYMLINK_NOFOLLOW) != 0 ||
-	    fchmodat(ff->ff_dirfd, newname, perm, AT_SYMLINK_NOFOLLOW) != 0 ||
+	    fchmodat(ff->ff_dirfd, newname, perm, 0) != 0 ||
 	    fstatat(ff->ff_dirfd, newname, st, AT_SYMLINK_NOFOLLOW) != 0)
 		error = errno;
 	else if ((st->st_mode & S_IFMT) != (mode & S_IFMT))
@@ -1445,7 +1525,7 @@ fs_imkfifo(void *softc, struct l9p_fid *dir, char *name,
 
 	/* We cannot open the new name; race to use l* syscalls. */
 	if (fchownat(ff->ff_dirfd, newname, uid, gid, AT_SYMLINK_NOFOLLOW) != 0 ||
-	    fchmodat(ff->ff_dirfd, newname, perm, AT_SYMLINK_NOFOLLOW) != 0 ||
+	    fchmodat(ff->ff_dirfd, newname, perm, 0) != 0 ||
 	    fstatat(ff->ff_dirfd, newname, st, AT_SYMLINK_NOFOLLOW) != 0)
 		error = errno;
 	else if (!S_ISFIFO(st->st_mode))
@@ -1467,12 +1547,12 @@ fs_imksocket(void *softc, struct l9p_fid *dir, char *name,
     bool isp9, mode_t perm, gid_t egid, struct stat *st)
 {
 	struct fs_fid *ff;
-	struct sockaddr_un sun;
+	struct sockaddr_un un;
 	char *path;
 	char newname[MAXPATHLEN];
 	gid_t gid;
 	uid_t uid;
-	int error = 0, s, fd;
+	int error = 0, s, fd, slen;
 
 	ff = dir->lo_aux;
 	error = fs_buildname(dir, name, newname, sizeof(newname));
@@ -1494,7 +1574,7 @@ fs_imksocket(void *softc, struct l9p_fid *dir, char *name,
 	fd = -1;
 #ifdef HAVE_BINDAT
 	/* Try bindat() if needed. */
-	if (strlen(path) >= sizeof(sun.sun_path)) {
+	if (strlen(path) >= sizeof(un.sun_path)) {
 		fd = openat(ff->ff_dirfd, ff->ff_name,
 		    O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
 		if (fd >= 0)
@@ -1512,23 +1592,28 @@ fs_imksocket(void *softc, struct l9p_fid *dir, char *name,
 	 * Unix-like system, this was known to behave oddly,
 	 * so we test for ">=" rather than just ">".
 	 */
-	if (strlen(path) >= sizeof(sun.sun_path)) {
+	if (strlen(path) >= sizeof(un.sun_path)) {
 		error = ENAMETOOLONG;
 		goto out;
 	}
-	sun.sun_family = AF_UNIX;
-	sun.sun_len = sizeof(struct sockaddr_un);
-	strncpy(sun.sun_path, path, sizeof(sun.sun_path));
+	un.sun_family = AF_UNIX;
+#ifndef __illumos__
+	slen = un.sun_len = sizeof(struct sockaddr_un);
+#else
+	slen = SUN_LEN(&un);
+#endif
+
+	strncpy(un.sun_path, path, sizeof(un.sun_path));
 
 #ifdef HAVE_BINDAT
 	if (fd >= 0) {
-		if (bindat(fd, s, (struct sockaddr *)&sun, sun.sun_len) < 0)
+		if (bindat(fd, s, (struct sockaddr *)&un, slen) < 0)
 			error = errno;
 		goto out;	/* done now, for good or ill */
 	}
 #endif
 
-	if (bind(s, (struct sockaddr *)&sun, sun.sun_len) < 0)
+	if (bind(s, (struct sockaddr *)&un, slen) < 0)
 		error = errno;
 out:
 
@@ -1540,7 +1625,7 @@ out:
 		 * but we get bogus data!
 		 */
 		if (fchownat(ff->ff_dirfd, newname, uid, gid, AT_SYMLINK_NOFOLLOW) != 0 ||
-		    fchmodat(ff->ff_dirfd, newname, perm, AT_SYMLINK_NOFOLLOW) != 0 ||
+		    fchmodat(ff->ff_dirfd, newname, perm, 0) != 0 ||
 		    fstatat(ff->ff_dirfd, newname, st, AT_SYMLINK_NOFOLLOW) != 0)
 			error = errno;
 		else if (!S_ISSOCK(st->st_mode))
@@ -1659,8 +1744,10 @@ fs_read(void *softc, struct l9p_request *req)
 		struct stat st;
 		struct l9p_message msg;
 		long o;
+		int err;
 
-		pthread_mutex_lock(&file->ff_mtx);
+		if ((err = pthread_mutex_lock(&file->ff_mtx)) != 0)
+			return (err);
 
 		/*
 		 * Must use telldir before readdir since seekdir
@@ -1695,12 +1782,12 @@ fs_read(void *softc, struct l9p_request *req)
 #endif
 		}
 
-		pthread_mutex_unlock(&file->ff_mtx);
+		(void) pthread_mutex_unlock(&file->ff_mtx);
 	} else {
 		size_t niov = l9p_truncate_iov(req->lr_data_iov,
                     req->lr_data_niov, req->lr_req.io.count);
 
-#if defined(__FreeBSD__)
+#if defined(__FreeBSD__) || defined(__illumos__)
 		ret = preadv(file->ff_fd, req->lr_data_iov, niov,
 		    req->lr_req.io.offset);
 #else
@@ -1991,7 +2078,7 @@ fs_write(void *softc, struct l9p_request *req)
 	size_t niov = l9p_truncate_iov(req->lr_data_iov,
             req->lr_data_niov, req->lr_req.io.count);
 
-#if defined(__FreeBSD__)
+#if defined(__FreeBSD__) || defined(__illumos__)
 	ret = pwritev(file->ff_fd, req->lr_data_iov, niov,
 	    req->lr_req.io.offset);
 #else
@@ -2126,7 +2213,11 @@ fs_statfs(void *softc __unused, struct l9p_request *req)
 {
 	struct fs_fid *file;
 	struct stat st;
+#ifdef __illumos__
+	struct statvfs f;
+#else
 	struct statfs f;
+#endif
 	long name_max;
 	int error;
 	int fd;
@@ -2152,8 +2243,13 @@ fs_statfs(void *softc __unused, struct l9p_request *req)
 	if (fd < 0)
 		return (errno);
 
+#ifdef __illumos__
+	if (fstatvfs(fd, &f) != 0)
+		return (errno);
+#else
 	if (fstatfs(fd, &f) != 0)
 		return (errno);
+#endif
 
 	name_max = fpathconf(fd, _PC_NAME_MAX);
 	error = errno;
@@ -2452,23 +2548,23 @@ fs_getattr(void *softc __unused, struct l9p_request *req)
 	}
 	if (mask & L9PL_GETATTR_ATIME) {
 		req->lr_resp.rgetattr.atime_sec =
-		    (uint64_t)st.st_atimespec.tv_sec;
+		    (uint64_t)STAT_ATIME(&st).tv_sec;
 		req->lr_resp.rgetattr.atime_nsec =
-		    (uint64_t)st.st_atimespec.tv_nsec;
+		    (uint64_t)STAT_ATIME(&st).tv_nsec;
 		valid |= L9PL_GETATTR_ATIME;
 	}
 	if (mask & L9PL_GETATTR_MTIME) {
 		req->lr_resp.rgetattr.mtime_sec =
-		    (uint64_t)st.st_mtimespec.tv_sec;
+		    (uint64_t)STAT_MTIME(&st).tv_sec;
 		req->lr_resp.rgetattr.mtime_nsec =
-		    (uint64_t)st.st_mtimespec.tv_nsec;
+		    (uint64_t)STAT_MTIME(&st).tv_nsec;
 		valid |= L9PL_GETATTR_MTIME;
 	}
 	if (mask & L9PL_GETATTR_CTIME) {
 		req->lr_resp.rgetattr.ctime_sec =
-		    (uint64_t)st.st_ctimespec.tv_sec;
+		    (uint64_t)STAT_CTIME(&st).tv_sec;
 		req->lr_resp.rgetattr.ctime_nsec =
-		    (uint64_t)st.st_ctimespec.tv_nsec;
+		    (uint64_t)STAT_CTIME(&st).tv_nsec;
 		valid |= L9PL_GETATTR_CTIME;
 	}
 	if (mask & L9PL_GETATTR_BTIME) {
@@ -2477,6 +2573,10 @@ fs_getattr(void *softc __unused, struct l9p_request *req)
 		    (uint64_t)st.st_birthtim.tv_sec;
 		req->lr_resp.rgetattr.btime_nsec =
 		    (uint64_t)st.st_birthtim.tv_nsec;
+#elif defined(__illumos__)
+		getcrtime(softc, file->ff_dirfd, file->ff_name,
+		    &req->lr_resp.rgetattr.btime_sec,
+		    &req->lr_resp.rgetattr.btime_nsec);
 #else
 		req->lr_resp.rgetattr.btime_sec = 0;
 		req->lr_resp.rgetattr.btime_nsec = 0;
@@ -2494,10 +2594,12 @@ fs_getattr(void *softc __unused, struct l9p_request *req)
 		req->lr_resp.rgetattr.blocks = (uint64_t)st.st_blocks;
 		valid |= L9PL_GETATTR_BLOCKS;
 	}
+#ifndef __illumos__
 	if (mask & L9PL_GETATTR_GEN) {
 		req->lr_resp.rgetattr.gen = st.st_gen;
 		valid |= L9PL_GETATTR_GEN;
 	}
+#endif
 	/* don't know what to do with data version yet */
 
 	generate_qid(&st, &req->lr_resp.rgetattr.qid);
@@ -2544,7 +2646,7 @@ fs_setattr(void *softc, struct l9p_request *req)
 	if (mask & L9PL_SETATTR_MODE) {
 		if (fchmodat(file->ff_dirfd, file->ff_name,
 		    req->lr_req.tsetattr.mode & 0777,
-		    AT_SYMLINK_NOFOLLOW)) {
+		    0)) {
 			error = errno;
 			goto out;
 		}
@@ -2578,15 +2680,15 @@ fs_setattr(void *softc, struct l9p_request *req)
 	}
 
 	if (mask & (L9PL_SETATTR_ATIME | L9PL_SETATTR_MTIME)) {
-		ts[0].tv_sec = st.st_atimespec.tv_sec;
-		ts[0].tv_nsec = st.st_atimespec.tv_nsec;
-		ts[1].tv_sec = st.st_mtimespec.tv_sec;
-		ts[1].tv_nsec = st.st_mtimespec.tv_nsec;
+		ts[0].tv_sec = STAT_ATIME(&st).tv_sec;
+		ts[0].tv_nsec = STAT_ATIME(&st).tv_nsec;
+		ts[1].tv_sec = STAT_MTIME(&st).tv_sec;
+		ts[1].tv_nsec = STAT_MTIME(&st).tv_nsec;
 
 		if (mask & L9PL_SETATTR_ATIME) {
 			if (mask & L9PL_SETATTR_ATIME_SET) {
-				ts[0].tv_sec = (time_t)req->lr_req.tsetattr.atime_sec;
-				ts[0].tv_nsec = (long)req->lr_req.tsetattr.atime_nsec;
+				ts[0].tv_sec = req->lr_req.tsetattr.atime_sec;
+				ts[0].tv_nsec = req->lr_req.tsetattr.atime_nsec;
 			} else {
 				if (clock_gettime(CLOCK_REALTIME, &ts[0]) != 0) {
 					error = errno;
@@ -2597,8 +2699,8 @@ fs_setattr(void *softc, struct l9p_request *req)
 
 		if (mask & L9PL_SETATTR_MTIME) {
 			if (mask & L9PL_SETATTR_MTIME_SET) {
-				ts[1].tv_sec = (time_t)req->lr_req.tsetattr.mtime_sec;
-				ts[1].tv_nsec = (long)req->lr_req.tsetattr.mtime_nsec;
+				ts[1].tv_sec = req->lr_req.tsetattr.mtime_sec;
+				ts[1].tv_nsec = req->lr_req.tsetattr.mtime_nsec;
 			} else {
 				if (clock_gettime(CLOCK_REALTIME, &ts[1]) != 0) {
 					error = errno;
@@ -2646,7 +2748,8 @@ fs_readdir(void *softc __unused, struct l9p_request *req)
 	if (file->ff_dir == NULL)
 		return (ENOTDIR);
 
-	pthread_mutex_lock(&file->ff_mtx);
+	if ((error = pthread_mutex_lock(&file->ff_mtx)) != 0)
+		return (error);
 
 	/*
 	 * It's not clear whether we can use the same trick for
@@ -2686,7 +2789,11 @@ fs_readdir(void *softc __unused, struct l9p_request *req)
 		de.qid.type = 0;
 		generate_qid(&st, &de.qid);
 		de.offset = (uint64_t)telldir(file->ff_dir);
+#ifdef __illumos__
+		de.type = st.st_mode & S_IFMT;
+#else
 		de.type = dp->d_type;
+#endif
 		de.name = dp->d_name;
 
 		/* Update count only if we completely pack the dirent. */
@@ -2695,7 +2802,7 @@ fs_readdir(void *softc __unused, struct l9p_request *req)
 		count = (uint32_t)msg.lm_size;
 	}
 
-	pthread_mutex_unlock(&file->ff_mtx);
+	(void) pthread_mutex_unlock(&file->ff_mtx);
 	req->lr_resp.io.count = count;
 	return (error);
 }
@@ -2958,21 +3065,21 @@ fs_freefid(void *softc __unused, struct l9p_fid *fid)
 	if (f->ff_dir)
 		closedir(f->ff_dir);
 
-	pthread_mutex_destroy(&f->ff_mtx);
+	(void) pthread_mutex_destroy(&f->ff_mtx);
 	free(f->ff_name);
 	ai = f->ff_ai;
 	l9p_acl_free(f->ff_acl);
 	free(f);
-	pthread_mutex_lock(&ai->ai_mtx);
+	(void) pthread_mutex_lock(&ai->ai_mtx);
 	newcount = --ai->ai_refcnt;
-	pthread_mutex_unlock(&ai->ai_mtx);
+	(void) pthread_mutex_unlock(&ai->ai_mtx);
 	if (newcount == 0) {
 		/*
 		 * We *were* the last ref, no one can have gained a ref.
 		 */
 		L9P_LOG(L9P_DEBUG, "dropped last ref to authinfo %p",
 		    (void *)ai);
-		pthread_mutex_destroy(&ai->ai_mtx);
+		(void) pthread_mutex_destroy(&ai->ai_mtx);
 		free(ai);
 	} else {
 		L9P_LOG(L9P_DEBUG, "authinfo %p now used by %lu",
@@ -2991,7 +3098,20 @@ l9p_backend_fs_init(struct l9p_backend **backendp, int rootfd, bool ro)
 #endif
 
 	if (!fs_attach_mutex_inited) {
+#ifdef __illumos__
+		if ((error = pthread_mutexattr_init(&fs_mutexattr)) != 0) {
+			errno = error;
+			return (-1);
+		}
+		if ((error = pthread_mutexattr_settype(&fs_mutexattr,
+		    PTHREAD_MUTEX_ERRORCHECK)) != 0) {
+			errno = error;
+			return (-1);
+		}
+		error = pthread_mutex_init(&fs_attach_mutex, &fs_mutexattr);
+#else
 		error = pthread_mutex_init(&fs_attach_mutex, NULL);
+#endif
 		if (error) {
 			errno = error;
 			return (-1);
@@ -3036,6 +3156,11 @@ l9p_backend_fs_init(struct l9p_backend **backendp, int rootfd, bool ro)
 	sc->fs_readonly = ro;
 	backend->softc = sc;
 
+#if defined(__illumos__)
+	if (fpathconf(rootfd, _PC_XATTR_ENABLED) > 0)
+		sc->fs_hasxattr = 1;
+#endif
+
 #if defined(WITH_CASPER)
 	capcas = cap_init();
 	if (capcas == NULL)
@@ -3052,6 +3177,8 @@ l9p_backend_fs_init(struct l9p_backend **backendp, int rootfd, bool ro)
 	cap_setpassent(sc->fs_cappwd, 1);
 	cap_setgroupent(sc->fs_capgrp, 1);
 	cap_close(capcas);
+#elif defined(__illumos__)
+	setpwent();
 #else
 	setpassent(1);
 #endif
@@ -3059,3 +3186,53 @@ l9p_backend_fs_init(struct l9p_backend **backendp, int rootfd, bool ro)
 	*backendp = backend;
 	return (0);
 }
+
+#ifdef __illumos__
+acl_t *
+acl_get_fd_np(int fd, int type)
+{
+	acl_t *acl;
+	int flag, ret;
+
+	flag = 0;
+	if (type == ACL_TYPE_NFS4)
+		flag = ACL_NO_TRIVIAL;
+
+	ret = facl_get(fd, flag, &acl);
+	if (ret != 0)
+		return (NULL);
+
+	return (acl);
+}
+
+static void
+getcrtime(struct fs_softc *sc, int dirfd, const char *fname, uint64_t *secp,
+    uint64_t *nsp)
+{
+	nvlist_t *nvl = NULL;
+	uint64_t *vals = NULL;
+	uint_t nvals = 0;
+	int error;
+
+	*secp = 0;
+	*nsp = 0;
+
+	if (!sc->fs_hasxattr)
+		return;
+
+	if ((error = getattrat(dirfd, XATTR_VIEW_READWRITE, fname, &nvl)) != 0)
+		return;
+
+	if (nvlist_lookup_uint64_array(nvl, "crtime", &vals, &nvals) != 0)
+		goto done;
+
+	if (nvals != 2)
+		goto done;
+
+	*secp = vals[0];
+	*nsp = vals[1];
+
+done:
+	nvlist_free(nvl);
+}
+#endif

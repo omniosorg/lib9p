@@ -33,6 +33,7 @@
 #include <unistd.h>
 #include <assert.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -44,6 +45,11 @@
 #include "lib9p.h"
 #include "fcall.h"
 #include "linux_errno.h"
+
+#ifdef __illumos__
+#include <sys/sysmacros.h>
+#include <grp.h>
+#endif
 
 #ifdef __APPLE__
   #define GETGROUPS_GROUP_TYPE_IS_INT
@@ -77,7 +83,7 @@ static void l9p_describe_size(const char *, uint64_t, struct sbuf *);
 static void l9p_describe_ugid(const char *, uint32_t, struct sbuf *);
 static void l9p_describe_getattr_mask(uint64_t, struct sbuf *);
 static void l9p_describe_unlinkat_flags(const char *, uint32_t, struct sbuf *);
-static const char *lookup_linux_errno(uint32_t);
+static const char *lookup_linux_errno(uint32_t, char *, size_t);
 
 /*
  * Using indexed initializers, we can have these occur in any order.
@@ -131,12 +137,14 @@ static const char *ftype_names[] = {
 #undef X
 
 void
-l9p_seek_iov(struct iovec *iov1, size_t niov1, struct iovec *iov2,
+l9p_seek_iov(const struct iovec *iov1, size_t niov1, struct iovec *iov2,
     size_t *niov2, size_t seek)
 {
 	size_t remainder = 0;
 	size_t left = seek;
 	size_t i, j;
+
+	assert(niov1 <= L9P_MAX_IOV);
 
 	for (i = 0; i < niov1; i++) {
 		size_t toseek = MIN(left, iov1[i].iov_len);
@@ -215,12 +223,19 @@ l9p_getgrlist(const char *name, gid_t basegid, int *angroups)
 		return (NULL);
 	}
 #ifdef GETGROUPS_GROUP_TYPE_IS_INT
-	(void) getgrouplist(name, (int)basegid, int_groups, &ngroups);
+	if (getgrouplist(name, (int)basegid, int_groups, &ngroups) < 0) {
+		free(groups);
+		free(int_groups);
+		return (NULL);
+	}
 	for (i = 0; i < ngroups; i++)
 		groups[i] = (gid_t)int_groups[i];
 	free(int_groups);
 #else
-	(void) getgrouplist(name, basegid, groups, &ngroups);
+	if (getgrouplist(name, basegid, groups, &ngroups) < 0) {
+		free(groups);
+		return (NULL);
+	}
 #endif
 	*angroups = ngroups;
 	return (groups);
@@ -404,6 +419,80 @@ l9p_describe_name(const char *str, char *name, struct sbuf *sb)
 		sbuf_printf(sb, "%s\"%.*s\"", str, (int)len, name);
 }
 
+#define	STRMODE_SIZE 12
+
+#ifdef __illumos__
+static void
+strmode(mode_t mode, char *bp)
+{
+	char *const sbp = bp;
+
+	/*
+	 * The single caller does not pass in the file type as part of 'mode',
+	 * and ignores the first character in the returned buffer anyway.
+	 */
+	*bp++ = '?';
+
+#define	ONE(_cmp, _ch) ((mode & (_cmp)) != 0) ? (_ch) : '-'
+	*bp++ = ONE(S_IRUSR, 'r');
+	*bp++ = ONE(S_IWUSR, 'w');
+	switch (mode & (S_ISUID|S_IXUSR)) {
+	case S_ISUID|S_IXUSR:
+		*bp++ = 's';
+		break;
+	case S_ISUID:
+		*bp++ = 'S';
+		break;
+	case S_IXUSR:
+		*bp++ = 'x';
+		break;
+	case 0:
+		*bp++ = '-';
+	}
+
+	*bp++ = ONE(S_IRGRP, 'r');
+	*bp++ = ONE(S_IWGRP, 'w');
+	switch (mode & (S_ISGID|S_IXGRP|S_IFREG)) {
+	case S_ISGID|S_IXGRP:
+		*bp++ = 's';
+		break;
+	case S_ISGID|S_IFREG:
+		*bp++ = 'L';
+		break;
+	case S_ISGID:
+		*bp++ = 'S';
+		break;
+	case S_IXGRP:
+		*bp++ = 'x';
+		break;
+	default:
+		*bp++ = '-';
+	}
+
+	*bp++ = ONE(S_IROTH, 'r');
+	*bp++ = ONE(S_IWOTH, 'w');
+	switch (mode & (S_ISVTX|S_IXOTH)) {
+	case S_ISVTX|S_IXOTH:
+		*bp++ = 't';
+		break;
+	case S_ISVTX:
+		*bp++ = 'T';
+		break;
+	case S_IXOTH:
+		*bp++ = 'x';
+		break;
+	default:
+		*bp++ = '-';
+	}
+
+	*bp++ = ' ';
+	*bp = '\0';
+
+	assert(bp - sbp <= STRMODE_SIZE);
+#undef ONE
+}
+#endif /* __illumos__ */
+
 /*
  * Show permissions (rwx etc).  Prints the value in hex only if
  * the rwx bits do not cover the entire value.
@@ -411,7 +500,7 @@ l9p_describe_name(const char *str, char *name, struct sbuf *sb)
 static void
 l9p_describe_perm(const char *str, uint32_t mode, struct sbuf *sb)
 {
-	char pbuf[12];
+	char pbuf[STRMODE_SIZE];
 
 	strmode(mode & 0777, pbuf);
 	if ((mode & ~(uint32_t)0777) != 0)
@@ -466,6 +555,10 @@ l9p_describe_lperm(const char *str, uint32_t mode, struct sbuf *sb)
 		{ S_IFMT,	S_IFREG,	"S_IFREG" },
 		{ S_IFMT,	S_IFLNK,	"S_IFLNK" },
 		{ S_IFMT,	S_IFSOCK,	"S_IFSOCK" },
+#ifdef __illumos__
+		{ S_IFMT,	S_IFDOOR,	"S_IFDOOR" },
+		{ S_IFMT,	S_IFPORT,	"S_IFPORT" },
+#endif
 		{ 0, 0, NULL }
 	};
 	bool need_sep;
@@ -703,10 +796,8 @@ l9p_describe_unlinkat_flags(const char *str, uint32_t flags, struct sbuf *sb)
 }
 
 static const char *
-lookup_linux_errno(uint32_t linux_errno)
+lookup_linux_errno(uint32_t linux_errno, char *buf, size_t len)
 {
-	static char unknown[50];
-
 	/*
 	 * Error numbers in the "base" range (1..ERANGE) are common
 	 * across BSD, MacOS, Linux, and Plan 9.
@@ -821,9 +912,8 @@ lookup_linux_errno(uint32_t linux_errno)
 		return (table[linux_errno]);
 	if (linux_errno <= ERANGE)
 		return (strerror((int)linux_errno));
-	(void) snprintf(unknown, sizeof(unknown),
-	    "Unknown error %d", linux_errno);
-	return (unknown);
+	(void) snprintf(buf, len, "Unknown error %d", linux_errno);
+	return (buf);
 }
 
 void
@@ -836,7 +926,7 @@ l9p_describe_fcall(union l9p_fcall *fcall, enum l9p_version version,
 
 	assert(fcall != NULL);
 	assert(sb != NULL);
-	assert(version <= L9P_2000L && version >= L9P_INVALID_VERSION);
+	assert(version <= L9P_2000L);
 
 	type = fcall->hdr.type;
 
@@ -889,10 +979,14 @@ l9p_describe_fcall(union l9p_fcall *fcall, enum l9p_version version,
 		    fcall->error.errnum);
 		return;
 
-	case L9P_RLERROR:
+	case L9P_RLERROR: {
+		char unknown[50];
+
 		sbuf_printf(sb, " errnum=%d (%s)", fcall->error.errnum,
-		    lookup_linux_errno(fcall->error.errnum));
+		    lookup_linux_errno(fcall->error.errnum,
+		    unknown, sizeof(unknown)));
 		return;
+	}
 
 	case L9P_TFLUSH:
 		sbuf_printf(sb, " oldtag=%d", fcall->tflush.oldtag);

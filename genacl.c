@@ -32,15 +32,21 @@
 #include <sys/acl.h>
 #include <sys/stat.h>
 
+#ifdef __illumos__
+#include <sys/sysmacros.h>
+#endif
+
 #include "lib9p.h"
 #include "lib9p_impl.h"
 #include "genacl.h"
 #include "fid.h"
 #include "log.h"
 
+#ifndef __illumos__
 typedef int econvertfn(acl_entry_t, struct l9p_ace *);
+#endif
 
-#ifndef __APPLE__
+#ifdef __FreeBSD__
 static struct l9p_acl *l9p_new_acl(uint32_t acetype, uint32_t aceasize);
 static struct l9p_acl *l9p_growacl(struct l9p_acl *acl, uint32_t aceasize);
 static int l9p_count_aces(acl_t sysacl);
@@ -453,7 +459,7 @@ l9p_ace_mask_to_rwx(int32_t opmask)
 	return (rwx);
 }
 
-#ifndef __APPLE__
+#if defined(__FreeBSD__) || defined(__illumos__)
 /*
  * Allocate new ACL holder and ACEs.
  */
@@ -473,7 +479,9 @@ l9p_new_acl(uint32_t acetype, uint32_t aceasize)
 	}
 	return (ret);
 }
+#endif
 
+#ifdef __FreeBSD__
 /*
  * Expand ACL to accomodate more entries.
  *
@@ -716,5 +724,83 @@ l9p_freebsd_nfsv4acl_to_acl(acl_t sysacl)
 struct l9p_acl *
 l9p_darwin_nfsv4acl_to_acl(acl_t sysacl)
 {
+}
+#endif
+
+#if defined(HAVE__ILLUMOS_ACLS)
+
+static struct {
+	uint16_t ace_flag;
+	uint32_t l9_flag;
+} ace_flag_tbl[] = {
+	{ ACE_FILE_INHERIT_ACE,		L9P_ACEF_FILE_INHERIT_ACE },
+	{ ACE_DIRECTORY_INHERIT_ACE,	L9P_ACEF_DIRECTORY_INHERIT_ACE },
+	{ ACE_NO_PROPAGATE_INHERIT_ACE,	L9P_ACEF_NO_PROPAGATE_INHERIT_ACE },
+	{ ACE_INHERIT_ONLY_ACE,		L9P_ACEF_INHERIT_ONLY_ACE },
+	{ ACE_SUCCESSFUL_ACCESS_ACE_FLAG,
+	    L9P_ACEF_SUCCESSFUL_ACCESS_ACE_FLAG },
+	{ ACE_IDENTIFIER_GROUP,		L9P_ACEF_IDENTIFIER_GROUP },
+	/* There doesn't appear to be an equivalent for ACE_INHERITED_ACE */
+	{ ACE_OWNER,			L9P_ACEF_OWNER },
+	{ ACE_GROUP,			L9P_ACEF_GROUP },
+	{ ACE_EVERYONE, 		L9P_ACEF_EVERYONE }
+};
+
+struct l9p_acl *
+l9p_illumos_nfsv4acl_to_acl(acl_t *sysacl)
+{
+	struct l9p_acl *l9acl;
+	struct l9p_ace *l9ace;
+	ace_t *ent;
+	int i, j;
+
+	/* We only support NFSv4 ACLs.. so don't try this on UFS */
+	if (sysacl->acl_type != ACE_T)
+		return (NULL);
+
+	l9acl = l9p_new_acl(L9P_ACLTYPE_NFSv4, sysacl->acl_cnt);
+	if (l9acl == NULL)
+		return (NULL);
+
+	ent = sysacl->acl_aclp;
+	l9ace = l9acl->acl_aces;
+	for (i = 0; i < sysacl->acl_cnt; i++, ent++, l9ace++) {
+		switch (ent->a_type) {
+		case ACE_ACCESS_ALLOWED_ACE_TYPE:
+			l9ace->ace_type = L9P_ACET_ACCESS_ALLOWED;
+			break;
+		case ACE_ACCESS_DENIED_ACE_TYPE:
+			l9ace->ace_type = L9P_ACET_ACCESS_DENIED;
+			break;
+		case ACE_SYSTEM_AUDIT_ACE_TYPE:
+			l9ace->ace_type = L9P_ACET_SYSTEM_AUDIT;
+			break;
+		case ACE_SYSTEM_ALARM_ACE_TYPE:
+			l9ace->ace_type = L9P_ACET_SYSTEM_ALARM;
+			break;
+		default:
+			L9P_LOG(L9P_ERROR, "invalid ACL type");
+			l9p_acl_free(l9acl);
+			return (NULL);
+		}
+
+		l9ace->ace_flags = 0;
+		for (j = 0; j < ARRAY_SIZE(ace_flag_tbl); j++) {
+			if ((ent->a_flags & ace_flag_tbl[j].ace_flag) != 0)
+				l9ace->ace_flags |= ace_flag_tbl[j].l9_flag;
+		}
+
+		/*
+		 * In a bit of good fortune, the bit values for ace_t masks
+		 * and l9p masks are the same (l9p does have WRITE_RETENTION
+		 * and WRITE_RETENTION_HOLD which aren't used -- we're also
+		 * going ace_t->l9p so they dont matter in this context).
+		 */
+		l9ace->ace_mask = ent->a_access_mask;
+		l9ace->ace_idsize = sizeof (ent->a_who);
+		memcpy(l9acl->acl_aces, &ent->a_who, sizeof (ent->a_who));
+	}
+
+	return (l9acl);
 }
 #endif

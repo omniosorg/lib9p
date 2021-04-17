@@ -236,7 +236,7 @@ void l9p_respond(struct l9p_request *req, bool drop, bool rmtag);
 
 void l9p_init_msg(struct l9p_message *msg, struct l9p_request *req,
     enum l9p_pack_mode mode);
-void l9p_seek_iov(struct iovec *iov1, size_t niov1, struct iovec *iov2,
+void l9p_seek_iov(const struct iovec *iov1, size_t niov1, struct iovec *iov2,
     size_t *niov2, size_t seek);
 size_t l9p_truncate_iov(struct iovec *iov, size_t niov, size_t length);
 void l9p_describe_fcall(union l9p_fcall *fcall, enum l9p_version version,

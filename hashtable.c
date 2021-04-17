@@ -45,7 +45,7 @@ ht_init(struct ht *h, ssize_t size)
 	memset(h, 0, sizeof(struct ht));
 	h->ht_nentries = size;
 	h->ht_entries = l9p_calloc((size_t)size, sizeof(struct ht_entry));
-	pthread_rwlock_init(&h->ht_rwlock, NULL);
+	(void) pthread_rwlock_init(&h->ht_rwlock, NULL);
 
 	for (i = 0; i < size; i++)
 		TAILQ_INIT(&h->ht_entries[i].hte_items);
@@ -65,7 +65,7 @@ ht_destroy(struct ht *h)
 		}
 	}
 
-	pthread_rwlock_destroy(&h->ht_rwlock);
+	(void) pthread_rwlock_destroy(&h->ht_rwlock);
 	free(h->ht_entries);
 	h->ht_entries = NULL;
 }
@@ -75,9 +75,10 @@ ht_find(struct ht *h, uint32_t hash)
 {
 	void *result;
 
-	ht_rdlock(h);
+	if (ht_rdlock(h) != 0)
+		return (NULL);
 	result = ht_find_locked(h, hash);
-	ht_unlock(h);
+	(void) ht_unlock(h);
 	return (result);
 }
 
@@ -102,14 +103,17 @@ ht_add(struct ht *h, uint32_t hash, void *value)
 {
 	struct ht_entry *entry;
 	struct ht_item *item;
+	int err;
 
-	ht_wrlock(h);
+	if ((err = ht_wrlock(h)) != 0)
+		return (err);
+
 	entry = &h->ht_entries[hash % h->ht_nentries];
 
 	TAILQ_FOREACH(item, &entry->hte_items, hti_link) {
 		if (item->hti_hash == hash) {
 			errno = EEXIST;
-			ht_unlock(h);
+			(void) ht_unlock(h);
 			return (-1);
 		}
 	}
@@ -118,7 +122,7 @@ ht_add(struct ht *h, uint32_t hash, void *value)
 	item->hti_hash = hash;
 	item->hti_data = value;
 	TAILQ_INSERT_TAIL(&entry->hte_items, item, hti_link);
-	ht_unlock(h);
+	(void) ht_unlock(h);
 
 	return (0);
 }
@@ -127,10 +131,12 @@ int
 ht_remove(struct ht *h, uint32_t hash)
 {
 	int result;
+	int err;
 
-	ht_wrlock(h);
+	if ((err = ht_wrlock(h)) != 0)
+		return (err);
 	result = ht_remove_locked(h, hash);
-	ht_unlock(h);
+	(void) ht_unlock(h);
 	return (result);
 }
 
@@ -205,6 +211,7 @@ ht_remove_at_iter(struct ht_iter *iter)
 	struct ht_item *item;
 	struct ht *h;
 	ssize_t slot;
+	int err;
 
 	assert(iter != NULL);
 
@@ -215,11 +222,12 @@ ht_remove_at_iter(struct ht_iter *iter)
 
 	/* remove the item from the table, saving the NEXT one */
 	h = iter->htit_parent;
-	ht_wrlock(h);
+	if ((err = ht_wrlock(h)) != 0)
+		return (err);
 	slot = iter->htit_slot;
 	iter->htit_next = ht_iter_advance(iter, item);
 	TAILQ_REMOVE(&h->ht_entries[slot].hte_items, item, hti_link);
-	ht_unlock(h);
+	(void) ht_unlock(h);
 
 	/* mark us as no longer on an item, then free it */
 	iter->htit_curr = NULL;
@@ -257,9 +265,10 @@ ht_next(struct ht_iter *iter)
 	if ((item = iter->htit_next) == NULL) {
 		/* no pre-loaded next; find next from current */
 		h = iter->htit_parent;
-		ht_rdlock(h);
+		if (ht_rdlock(h) != 0)
+			return (NULL);
 		item = ht_iter_advance(iter, iter->htit_curr);
-		ht_unlock(h);
+		(void) ht_unlock(h);
 	} else
 		iter->htit_next = NULL;
 	iter->htit_curr = item;

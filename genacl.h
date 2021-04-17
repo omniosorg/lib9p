@@ -82,6 +82,11 @@
   #define HAVE_FREEBSD_ACLS
 #endif
 
+#if defined (__illumos__)
+  #define HAVE_POSIX_ACLS
+  #define HAVE__ILLUMOS_ACLS
+#endif
+
 #include <sys/types.h>
 #include <sys/acl.h>		/* XXX assumes existence of sys/acl.h */
 
@@ -300,6 +305,10 @@ struct l9p_acl *l9p_darwin_nfsv4acl_to_acl(acl_t acl);
 
 #if defined(HAVE_FREEBSD_ACLS)
 struct l9p_acl *l9p_freebsd_nfsv4acl_to_acl(acl_t acl);
+#endif
+
+#if defined(HAVE__ILLUMOS_ACLS)
+struct l9p_acl *l9p_illumos_nfsv4acl_to_acl(acl_t *acl);
 #endif
 
 #if defined(HAVE_POSIX_ACLS) && 0 /* not yet */

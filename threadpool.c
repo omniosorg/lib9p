@@ -2,6 +2,8 @@
  * Copyright 2016 Jakub Klama <jceel@FreeBSD.org>
  * All rights reserved
  *
+ * Copyright 2020 Joyent, Inc.
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted providing that the following conditions
  * are met:
@@ -48,11 +50,15 @@ l9p_responder(void *arg)
 	tp = worker->ltw_tp;
 	for (;;) {
 		/* get next reply to send */
-		pthread_mutex_lock(&tp->ltp_mtx);
-		while (STAILQ_EMPTY(&tp->ltp_replyq) && !worker->ltw_exiting)
-			pthread_cond_wait(&tp->ltp_reply_cv, &tp->ltp_mtx);
+
+		if (pthread_mutex_lock(&tp->ltp_mtx) != 0)
+			break;
+		while (STAILQ_EMPTY(&tp->ltp_replyq) && !worker->ltw_exiting) {
+			(void) pthread_cond_wait(&tp->ltp_reply_cv,
+			    &tp->ltp_mtx);
+		}
 		if (worker->ltw_exiting) {
-			pthread_mutex_unlock(&tp->ltp_mtx);
+			(void) pthread_mutex_unlock(&tp->ltp_mtx);
 			break;
 		}
 
@@ -67,7 +73,8 @@ l9p_responder(void *arg)
 		if (req->lr_flushstate != L9P_FLUSH_NONE)
 			l9p_threadpool_rflush(tp, req);
 
-		pthread_mutex_unlock(&tp->ltp_mtx);
+		if (pthread_mutex_unlock(&tp->ltp_mtx) != 0)
+			break;
 
 		/* send response */
 		l9p_respond(req, false, true);
@@ -83,10 +90,13 @@ l9p_worker(void *arg)
 	struct l9p_request *req;
 
 	tp = worker->ltw_tp;
-	pthread_mutex_lock(&tp->ltp_mtx);
+	if (pthread_mutex_lock(&tp->ltp_mtx) != 0)
+		return (NULL);
 	for (;;) {
-		while (STAILQ_EMPTY(&tp->ltp_workq) && !worker->ltw_exiting)
-			pthread_cond_wait(&tp->ltp_work_cv, &tp->ltp_mtx);
+		while (STAILQ_EMPTY(&tp->ltp_workq) && !worker->ltw_exiting) {
+			(void) pthread_cond_wait(&tp->ltp_work_cv,
+			    &tp->ltp_mtx);
+		}
 		if (worker->ltw_exiting)
 			break;
 
@@ -95,21 +105,22 @@ l9p_worker(void *arg)
 		STAILQ_REMOVE_HEAD(&tp->ltp_workq, lr_worklink);
 		req->lr_workstate = L9P_WS_INPROGRESS;
 		req->lr_worker = worker;
-		pthread_mutex_unlock(&tp->ltp_mtx);
+		(void) pthread_mutex_unlock(&tp->ltp_mtx);
 
 		/* actually try the request */
 		req->lr_error = l9p_dispatch_request(req);
 
 		/* move to responder queue, updating work-state */
-		pthread_mutex_lock(&tp->ltp_mtx);
+		if (pthread_mutex_lock(&tp->ltp_mtx) != 0)
+			return (NULL);
 		req->lr_workstate = L9P_WS_RESPQUEUED;
 		req->lr_worker = NULL;
 		STAILQ_INSERT_TAIL(&tp->ltp_replyq, req, lr_worklink);
 
 		/* signal the responder */
-		pthread_cond_signal(&tp->ltp_reply_cv);
+		(void) pthread_cond_signal(&tp->ltp_reply_cv);
 	}
-	pthread_mutex_unlock(&tp->ltp_mtx);
+	(void) pthread_mutex_unlock(&tp->ltp_mtx);
 	return (NULL);
 }
 
@@ -164,7 +175,19 @@ l9p_threadpool_init(struct l9p_threadpool *tp, int size)
 
 	if (size <= 0)
 		return (EINVAL);
+#ifdef __illumos__
+	pthread_mutexattr_t attr;
+
+	if ((error = pthread_mutexattr_init(&attr)) != 0)
+		return (error);
+	if ((error = pthread_mutexattr_settype(&attr,
+	    PTHREAD_MUTEX_ERRORCHECK)) != 0) {
+		return (error);
+	}
+	error = pthread_mutex_init(&tp->ltp_mtx, &attr);
+#else
 	error = pthread_mutex_init(&tp->ltp_mtx, NULL);
+#endif
 	if (error)
 		return (error);
 	error = pthread_cond_init(&tp->ltp_work_cv, NULL);
@@ -182,6 +205,10 @@ l9p_threadpool_init(struct l9p_threadpool *tp, int size)
 	nworkers = 0;
 	for (i = 0; i <= size; i++) {
 		worker = calloc(1, sizeof(struct l9p_worker));
+#ifdef __illumos__
+		if (worker == NULL)
+			break;
+#endif
 		worker->ltw_tp = tp;
 		worker->ltw_responder = i == 0;
 		error = pthread_create(&worker->ltw_thread, NULL,
@@ -203,6 +230,18 @@ l9p_threadpool_init(struct l9p_threadpool *tp, int size)
 			sprintf(threadname, "9p-worker:%d", i - 1);
 			pthread_set_name_np(worker->ltw_thread, threadname);
 		}
+#elif defined(__illumos__)
+		if (worker->ltw_responder) {
+			(void) pthread_setname_np(worker->ltw_thread,
+			    "9p-responder");
+		} else {
+			char threadname[PTHREAD_MAX_NAMELEN_NP];
+
+			(void) snprintf(threadname, sizeof (threadname),
+			    "9p-worker:%d", i - 1);
+			(void) pthread_setname_np(worker->ltw_thread,
+			    threadname);
+		}
 #endif
 
 		LIST_INSERT_HEAD(&tp->ltp_workers, worker, ltw_link);
@@ -221,9 +260,9 @@ l9p_threadpool_init(struct l9p_threadpool *tp, int size)
 	 * appealing...
 	 */
 fail_reply_cv:
-	pthread_cond_destroy(&tp->ltp_work_cv);
+	(void) pthread_cond_destroy(&tp->ltp_work_cv);
 fail_work_cv:
-	pthread_mutex_destroy(&tp->ltp_mtx);
+	(void) pthread_mutex_destroy(&tp->ltp_mtx);
 
 	return (error);
 }
@@ -245,11 +284,12 @@ l9p_threadpool_run(struct l9p_threadpool *tp, struct l9p_request *req)
 		req->lr_workstate = L9P_WS_IMMEDIATE;
 		(void) l9p_dispatch_request(req);
 	} else {
-		pthread_mutex_lock(&tp->ltp_mtx);
+		if (pthread_mutex_lock(&tp->ltp_mtx) != 0)
+			return;
 		req->lr_workstate = L9P_WS_NOTSTARTED;
 		STAILQ_INSERT_TAIL(&tp->ltp_workq, req, lr_worklink);
-		pthread_cond_signal(&tp->ltp_work_cv);
-		pthread_mutex_unlock(&tp->ltp_mtx);
+		(void) pthread_cond_signal(&tp->ltp_work_cv);
+		(void) pthread_mutex_unlock(&tp->ltp_mtx);
 	}
 }
 
@@ -264,7 +304,8 @@ l9p_threadpool_tflush(struct l9p_request *req)
 	struct l9p_threadpool *tp;
 	struct l9p_request *flushee;
 	uint16_t oldtag;
-	enum l9p_flushstate nstate;
+	enum l9p_flushstate nstate = L9P_FLUSH_NONE;
+	int err;
 
 	/*
 	 * Find what we're supposed to flush (the flushee, as it were).
@@ -273,7 +314,8 @@ l9p_threadpool_tflush(struct l9p_request *req)
 	conn = req->lr_conn;
 	tp = &conn->lc_tp;
 	oldtag = req->lr_req.tflush.oldtag;
-	ht_wrlock(&conn->lc_requests);
+	if ((err = ht_wrlock(&conn->lc_requests)) != 0)
+		return (err);
 	flushee = ht_find_locked(&conn->lc_requests, oldtag);
 	if (flushee == NULL) {
 		/*
@@ -281,8 +323,9 @@ l9p_threadpool_tflush(struct l9p_request *req)
 		 * been done and gone already.  Just queue this
 		 * Tflush for a success reply.
 		 */
-		ht_unlock(&conn->lc_requests);
-		pthread_mutex_lock(&tp->ltp_mtx);
+		(void) ht_unlock(&conn->lc_requests);
+		if ((err = pthread_mutex_lock(&tp->ltp_mtx)) != 0)
+			return (err);
 		goto done;
 	}
 
@@ -290,8 +333,11 @@ l9p_threadpool_tflush(struct l9p_request *req)
 	 * Found the original request.  We'll need to inspect its
 	 * work-state to figure out what to do.
 	 */
-	pthread_mutex_lock(&tp->ltp_mtx);
-	ht_unlock(&conn->lc_requests);
+	if ((err = pthread_mutex_lock(&tp->ltp_mtx)) != 0) {
+		(void) ht_unlock(&conn->lc_requests);
+		return (err);
+	}
+	(void) ht_unlock(&conn->lc_requests);
 
 	switch (flushee->lr_workstate) {
 
@@ -381,7 +427,7 @@ l9p_threadpool_tflush(struct l9p_request *req)
 	flushee->lr_flushstate = nstate;
 	STAILQ_INSERT_TAIL(&flushee->lr_flushq, req, lr_flushlink);
 
-	pthread_mutex_unlock(&tp->ltp_mtx);
+	(void) pthread_mutex_unlock(&tp->ltp_mtx);
 
 	return (0);
 
@@ -392,8 +438,8 @@ done:
 	 */
 	req->lr_workstate = L9P_WS_RESPQUEUED;
 	STAILQ_INSERT_TAIL(&tp->ltp_replyq, req, lr_worklink);
-	pthread_mutex_unlock(&tp->ltp_mtx);
-	pthread_cond_signal(&tp->ltp_reply_cv);
+	(void) pthread_mutex_unlock(&tp->ltp_mtx);
+	(void) pthread_cond_signal(&tp->ltp_reply_cv);
 	return (0);
 }
 
@@ -403,20 +449,21 @@ l9p_threadpool_shutdown(struct l9p_threadpool *tp)
 	struct l9p_worker *worker, *tmp;
 
 	LIST_FOREACH_SAFE(worker, &tp->ltp_workers, ltw_link, tmp) {
-		pthread_mutex_lock(&tp->ltp_mtx);
+		if (pthread_mutex_lock(&tp->ltp_mtx) != 0)
+			continue;
 		worker->ltw_exiting = true;
 		if (worker->ltw_responder)
-			pthread_cond_signal(&tp->ltp_reply_cv);
+			(void) pthread_cond_signal(&tp->ltp_reply_cv);
 		else
-			pthread_cond_broadcast(&tp->ltp_work_cv);
-		pthread_mutex_unlock(&tp->ltp_mtx);
-		pthread_join(worker->ltw_thread, NULL);
+			(void) pthread_cond_broadcast(&tp->ltp_work_cv);
+		(void) pthread_mutex_unlock(&tp->ltp_mtx);
+		(void) pthread_join(worker->ltw_thread, NULL);
 		LIST_REMOVE(worker, ltw_link);
 		free(worker);
 	}
-	pthread_cond_destroy(&tp->ltp_reply_cv);
-	pthread_cond_destroy(&tp->ltp_work_cv);
-	pthread_mutex_destroy(&tp->ltp_mtx);
+	(void) pthread_cond_destroy(&tp->ltp_reply_cv);
+	(void) pthread_cond_destroy(&tp->ltp_work_cv);
+	(void) pthread_mutex_destroy(&tp->ltp_mtx);
 
 	return (0);
 }

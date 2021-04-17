@@ -28,6 +28,10 @@
 #ifndef LIB9P_RFUNCS_H
 #define LIB9P_RFUNCS_H
 
+#if defined(__illumos__) && !defined(_POSIX_PTHREAD_SEMANTICS)
+#define	_POSIX_PTHREAD_SEMANTICS 1
+#endif
+
 #include <grp.h>
 #include <pwd.h>
 #include <string.h>

@@ -237,7 +237,7 @@ r_pgexpand(struct r_pgdata *pg)
 
 	nsize = pg->r_pgbufsize << 1;
 	if (nsize >= (1 << 20) ||
-	    (pg->r_pgbuf = realloc(pg->r_pgbuf, nsize)) == NULL)
+	    (pg->r_pgbuf = reallocf(pg->r_pgbuf, nsize)) == NULL)
 		return (ENOMEM);
 	return (0);
 }

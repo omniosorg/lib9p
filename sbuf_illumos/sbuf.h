@@ -1,7 +1,4 @@
 /*
- * Copyright 2016 Jakub Klama <jceel@FreeBSD.org>
- * All rights reserved
- *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted providing that the following conditions
  * are met:
@@ -25,15 +22,30 @@
  *
  */
 
-#ifndef LIB9P_SOCKET_H
-#define LIB9P_SOCKET_H
+/*
+ * Minimal libsbuf wrapper around libcustr for illumos.
+ */
 
-#include <sys/types.h>
-#include <sys/socket.h>
-#include "../lib9p.h"
+#ifndef LIB9P_SBUF_H
+#define LIB9P_SBUF_H
 
-int l9p_start_server(struct l9p_server *server, const char *host,
-    const char *port);
-void l9p_socket_accept(struct l9p_server *server, int serv_fd);
+#include <stdarg.h>
+#include <libcustr.h>
 
-#endif /* LIB9P_SOCKET_H */
+struct sbuf
+{
+	custr_t *s_custr;
+};
+
+struct sbuf *sbuf_new_auto(void);
+char *sbuf_data(struct sbuf *s);
+int sbuf_printf(struct sbuf *s, const char *fmt, ...);
+void sbuf_delete(struct sbuf *s);
+
+#define	sbuf_cat(s, str) custr_append((s)->s_custr, (str))
+#define	sbuf_vprintf(s, fmt, args) \
+    custr_append_vprintf((s)->s_custr, (fmt), (args))
+#define	sbuf_data(s) custr_cstr((s)->s_custr)
+#define	sbuf_finish(s)
+
+#endif /* LIB9P_SBUF_H */

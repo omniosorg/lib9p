@@ -31,6 +31,9 @@
 #include <errno.h>
 #include <sys/param.h>
 #include <sys/uio.h>
+#ifdef __illumos__
+#include <sys/sysmacros.h>
+#endif
 #if defined(__FreeBSD__)
 #include <sys/sbuf.h>
 #else
@@ -293,7 +296,9 @@ e2linux(int errnum)
 		[EHOSTDOWN] = LINUX_EHOSTDOWN,
 		[EHOSTUNREACH] = LINUX_EHOSTUNREACH,
 		[ENOTEMPTY] = LINUX_ENOTEMPTY,
+#ifndef __illumos__
 		[EPROCLIM] = LINUX_EAGAIN,
+#endif
 		[EUSERS] = LINUX_EUSERS,
 		[EDQUOT] = LINUX_EDQUOT,
 		[ESTALE] = LINUX_ESTALE,
@@ -391,6 +396,7 @@ l9p_respond(struct l9p_request *req, bool drop, bool rmtag)
 
 	switch (req->lr_flushstate) {
 	case L9P_FLUSH_NONE:
+	default:
 		ftype = "";
 		break;
 	case L9P_FLUSH_REQUESTED_PRE_START:
